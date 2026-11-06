@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Inference Stack cover – Infinite Mandelbrot Zoom</title>
+<!--
+  Endless self-similar Mandelbrot zoom into the Misiurewicz point i (5.66x + 45 deg per cycle), Aurora palette.
+  Standalone port of the cover-slide effect from https://faraz.github.io/talks/ (inference-stack deck).
+  Reconstructed from the published, minified bundle for study purposes: the original source repo is not public.
+  Three layers:
+    1. WebGL2 fragment shader  -> flowing, breathing OKLCH glow (rendered to an off-screen texture)
+    2. WebGL2 fragment shader  -> converts that texture into ASCII glyph cells (atlas drawn with a 2D canvas)
+    3. "Decode" text effect    -> per-character scramble, then lock, measured with the DOM Range API
+
+  Keys:  R = replay decode   . = skip decode   A = toggle ASCII layer (added for this demo)
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #03050C; overflow: hidden; }
+  /* Fixed 1920x1080 design canvas, scaled to fit the window (same model open-slide uses). */
+  #stage {
+    position: absolute; left: 50%; top: 50%;
+    width: 1920px; height: 1080px;
+    transform-origin: 0 0;
+    overflow: hidden; isolation: isolate;
+    background: #03050C; color: #F3F6FC;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  #gl { position: absolute; inset: 0; }
+  #gl canvas { width: 100%; height: 100%; display: block; opacity: 0; transition: opacity 350ms cubic-bezier(0, 0, 0.2, 1); }
+  #scrim {
+    position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(90deg, rgba(3,5,12,0.88) 0%, rgba(3,5,12,0.8) 34%, rgba(3,5,12,0.35) 58%, rgba(3,5,12,0) 76%);
+  }
+  #content {
+    position: absolute; inset: 0; z-index: 2;
+    display: flex; flex-direction: column; justify-content: space-between;
+    padding: 96px 120px 62px;
+  }
+  .mono {
+    font-family: "Departure Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 26px; letter-spacing: 0.05em; color: #A9B7D9;
+  }
+  #meta { display: flex; flex-direction: column; gap: 10px; color: #F3F6FC; text-shadow: 0 0 12px #03050C, 0 0 4px #03050C; }
+  #hero { display: flex; flex-direction: column; gap: 36px; text-shadow: 0 0 40px #03050C; }
+  h1 {
+    margin: 0; max-width: 1160px;
+    font-size: 136px; font-weight: 800; line-height: 134px; letter-spacing: -0.04em;
+  }
+  #sub { margin: 0; font-size: 36px; line-height: 50px; color: #A9B7D9; font-weight: 600; }
+  #hint { font-size: 22px; color: rgba(169,183,217,0.75); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="gl" aria-hidden="true"></div>
+  <div id="scrim" aria-hidden="true"></div>
+  <div id="content">
+    <div id="meta" class="mono">
+      <span>2 OCT 2026</span>
+      <span><b>SERIES</b>: AI FIRST PRINCIPLES</span>
+    </div>
+    <div id="hero">
+      <h1 id="title">The Anatomy of an Inference Stack</h1>
+      <p id="sub">What happens between your prompt and its reply, from <b>first principles.</b></p>
+    </div>
+    <div id="hint" class="mono">R replay decode &nbsp;·&nbsp; . skip &nbsp;·&nbsp; A toggle ASCII layer</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ═══ STAGE SCALING ═══
+const stage = document.getElementById("stage");
+function fit() {
+  const s = Math.min(innerWidth / 1920, innerHeight / 1080);
+  stage.style.transform = `scale(${s}) translate(-50%, -50%)`;
+}
+addEventListener("resize", fit);
+fit();
+
+const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// ═══ LAYER 1 + 2: WEBGL ═══
+const VERT = `#version 300 es
+void main() {
+  vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+// Pass 1: Mandelbrot set -> glow texture.
+const FRAG_GLOW = `#version 300 es
+precision highp float;
+
+uniform vec2 iResolution;
+uniform float iTime;
+uniform vec3 uDarkBackground;
+out vec4 fragColor;
+
+// ── palette (OKLCH), same parameters as the glow variants ──
+const float HUE = 0.36;
+const float HUE_SPREAD = 0.24;
+const float CHROMA = 0.15;
+const float LIGHTNESS = 0.58;
+const float LIGHT_SWING = 0.208;
+const float BAND_FREQ = 0.42;      // colour bands per iteration
+const float BAND_DRIFT = 0.6;    // colour flow speed (rad/s)
+const float GLOW_RATE = 0.075;            // brightness ramp vs. iteration count
+const float VIGNETTE = 0.0558240488;
+const float TAU = 6.28318530718;
+
+// OKLCH -> linear RGB
+vec3 oklchToLinear(float L, float C, float h) {
+  float a = C * cos(h), b = C * sin(h);
+  float l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  float m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  float s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+  vec3 lms = vec3(l_, m_, s_);
+  lms = lms * lms * lms;
+  return mat3(4.0767416621, -1.2684380046, -0.0041960863,
+              -3.3077115913, 2.6097574011, -0.7034186147,
+              0.2309699292, -0.3413193965, 1.7076147010) * lms;
+}
+
+float blueNoise(vec2 p, float frame) {
+  p += 5.588238 * mod(frame, 64.0);
+  return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
+}
+
+// Smooth (continuous) escape count; negative => never escaped (inside the set).
+float mandel(vec2 c) {
+
+  vec2 z = vec2(0.0);
+  for (int i = 0; i < 320; i++) {
+    z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+    float m = dot(z, z);
+    if (m > 1.0e4) return float(i) + 1.0 - log2(0.5 * log(m));
+  }
+  return -1.0;
+}
+
+// Escape count -> linear colour "ink" (added over the dark background later).
+vec3 shade(float mu, float t) {
+  if (mu < 0.0) return vec3(0.0);
+  float glow = 1.0 - exp(-max(mu, 0.0) * GLOW_RATE);
+  float k = 0.5 + 0.5 * sin(mu * BAND_FREQ - t * BAND_DRIFT);
+  float hue0 = HUE * TAU, hue1 = hue0 + HUE_SPREAD * TAU;
+  vec3 tint = clamp(oklchToLinear(LIGHTNESS + LIGHT_SWING * k, CHROMA * (0.75 + 0.35 * k), mix(hue0, hue1, k)), 0.0, 1.0);
+  return tint * glow * (0.55 + 0.75 * k);
+}
+
+vec3 finish(vec3 color, vec2 pos) {
+  // filmic tone-map (ACES approximation), per-channel gamma, vignette, background lift, dither
+  vec3 x = max(color, 0.0);
+  color = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+  color = pow(clamp(color, 0.0, 1.0), vec3(0.85, 0.92, 0.98));
+  color *= 1.0 - smoothstep(0.5, 1.6, length(pos)) * VIGNETTE;
+  color = uDarkBackground + color * (1.0 - uDarkBackground);
+  color += (blueNoise(gl_FragCoord.xy, floor(iTime * 24.0)) - 0.5) / 255.0;
+  return clamp(color, 0.0, 1.0);
+}
+
+const vec2 C0 = vec2(0.0, 1.0);                    // Misiurewicz point i
+const float LAMBDA_LEN = 5.65685424949;            // |4 + 4i|
+const float LAMBDA_ARG = 0.78539816340;            // arg(4 + 4i) = 45 degrees
+const float BASE_HEIGHT = 0.0035;                  // view height (c-plane units) at level 0
+const float CYCLE_SECONDS = 14.0;               // seconds per 5.66x zoom
+
+vec3 layer(vec2 pos, float level) {
+  float a = -LAMBDA_ARG * level;
+  float ca = cos(a), sa = sin(a);
+  vec2 c = C0 + mat2(ca, sa, -sa, ca) * pos * (BASE_HEIGHT * exp(-level * log(LAMBDA_LEN)));
+  float mu = mandel(c);
+  if (mu >= 0.0) mu -= 2.0 * level;                 // undo the +2 per cycle so every level shares one palette phase
+  return shade(mu, iTime);
+}
+
+void main() {
+  vec2 R = iResolution.xy;
+  vec2 pos = (gl_FragCoord.xy - vec2(0.64, 0.5) * R) / R.y;
+  float level = iTime / CYCLE_SECONDS;
+  float phi = fract(level);
+  float w = smoothstep(0.0, 1.0, phi);
+  vec3 ink = mix(layer(pos, phi), layer(pos, phi - 1.0), w);
+  fragColor = vec4(finish(ink, pos), 1.0);
+}
+`;
+
+// Pass 2: sample the glow in small cells, pick a glyph by brightness, keep 45% of the image underneath.
+// (uAscii is the only addition vs. the deck: it lets this demo toggle the layer.)
+const FRAG_ASCII = `#version 300 es
+precision highp float;
+
+uniform sampler2D tScene;
+uniform sampler2D tGlyphs;
+uniform vec2 iResolution;
+uniform vec3 uDarkBackground;
+uniform float uAscii;
+out vec4 fragColor;
+
+const float uStrength = 1.29589593;
+const float uScale = 1.04066491;
+const float uGlyphCount = 10.0;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+vec3 sceneInk(vec2 uv) { return texture(tScene, clamp(uv, 0.0, 1.0)).rgb - uDarkBackground; }
+
+void main() {
+  vec2 frag = gl_FragCoord.xy;
+  if (uAscii < 0.5) { fragColor = vec4(uDarkBackground + sceneInk(frag / iResolution), 1.0); return; }
+
+  vec2 cellPx = vec2(0.62, 1.0) * floor(uScale * 9.0 + 0.5);   // ~5 x 9 px character cell
+  vec2 cell = floor(frag / cellPx);
+  vec2 centre = (cell + 0.5) * cellPx;
+  vec3 ink = vec3(0.0);
+  ink += sceneInk(centre / iResolution) * 2.0;                  // centre sample counts double
+  ink += sceneInk((centre + cellPx * vec2(0.3, 0.3)) / iResolution);
+  ink += sceneInk((centre + cellPx * vec2(-0.3, 0.3)) / iResolution);
+  ink += sceneInk((centre + cellPx * vec2(0.3, -0.3)) / iResolution);
+  ink += sceneInk((centre + cellPx * vec2(-0.3, -0.3)) / iResolution);
+  ink /= 6.0;
+  float level = pow(clamp(dot(ink, LUMA) * (0.9 + 0.3 * uStrength), 0.0, 1.0), 0.9);
+  float glyph = floor(level * (uGlyphCount - 1.0) + 0.5);       // 0..9 -> index into the ramp
+  vec2 local = (frag - cell * cellPx) / cellPx;
+  float mask = texture(tGlyphs, vec2((glyph + local.x) / uGlyphCount, local.y)).r;
+  vec3 under = sceneInk(frag / iResolution) * 0.45;
+  vec3 color = uDarkBackground + clamp(under + ink * mask, 0.0, 1.0);
+  fragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+}
+`;
+
+const GLYPH_RAMP = " .:;+*oO8@";
+const DARK_BG = [3 / 255, 5 / 255, 12 / 255];
+let asciiOn = true;
+
+function startGL(host) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1920; canvas.height = 1080;
+  host.appendChild(canvas);
+  const gl = canvas.getContext("webgl2", { alpha: false, antialias: false, depth: false, stencil: false });
+  if (!gl) { canvas.remove(); host.textContent = "WebGL2 not available"; return; }
+
+  const compile = (frag) => {
+    const prog = gl.createProgram();
+    for (const [type, src] of [[gl.VERTEX_SHADER, VERT], [gl.FRAGMENT_SHADER, frag]]) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+      gl.attachShader(prog, sh);
+      gl.deleteShader(sh);
+    }
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    return prog;
+  };
+  const clampEdge = () => {
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  };
+
+  const glow = compile(FRAG_GLOW);
+  const ascii = compile(FRAG_ASCII);
+  const W = canvas.width, H = canvas.height;
+
+  // off-screen scene texture + framebuffer for pass 1
+  const sceneTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  clampEdge();
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneTex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // glyph atlas: 10 monospace glyphs, white on black, drawn with a 2D canvas
+  const atlas = document.createElement("canvas");
+  atlas.width = 480; atlas.height = 80;
+  const ctx = atlas.getContext("2d");
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, atlas.width, atlas.height);
+  ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = '500 62px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  for (let i = 0; i < 10; i++) ctx.fillText(GLYPH_RAMP[i], i * 48 + 24, 43.2);
+  const glyphTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, glyphTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  clampEdge();
+
+  const u1 = {
+    res: gl.getUniformLocation(glow, "iResolution"),
+    time: gl.getUniformLocation(glow, "iTime"),
+    dark: gl.getUniformLocation(glow, "uDarkBackground"),
+  };
+  const u2 = {
+    res: gl.getUniformLocation(ascii, "iResolution"),
+    dark: gl.getUniformLocation(ascii, "uDarkBackground"),
+    scene: gl.getUniformLocation(ascii, "tScene"),
+    glyphs: gl.getUniformLocation(ascii, "tGlyphs"),
+    on: gl.getUniformLocation(ascii, "uAscii"),
+  };
+
+  const draw = (time) => {
+    gl.viewport(0, 0, W, H);
+    // pass 1 -> texture
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.useProgram(glow);
+    gl.uniform2f(u1.res, W, H);
+    gl.uniform1f(u1.time, time);
+    gl.uniform3fv(u1.dark, DARK_BG);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    // pass 2 -> screen
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(ascii);
+    gl.uniform2f(u2.res, W, H);
+    gl.uniform3fv(u2.dark, DARK_BG);
+    gl.uniform1f(u2.on, asciiOn ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(u2.scene, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, glyphTex);  gl.uniform1i(u2.glyphs, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  };
+
+  if (reducedMotion) {
+    draw(2);                                   // single still frame
+  } else {
+    let last = 0, t = 0;
+    const loop = (now) => {
+      t += last ? Math.min((now - last) / 1000, 0.05) : 0;   // clamp dt so tab-switches don't jump
+      last = now;
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+  canvas.style.opacity = "1";
+}
+startGL(document.getElementById("gl"));
+
+// ═══ LAYER 3: DECODE TEXT ═══
+// Characters scramble among glyphs of similar width (so the line doesn't jitter), then lock to the real letter.
+const WIDTH_CLASSES = ["ijl", "frt", "mw", "abcdeghknopqsuvxyz", "IJ1", "023456789", "MW", "BEFKLPRSTXYZ", "ACDGHNOQUV"];
+const widthClass = (ch) => WIDTH_CLASSES.find((c) => c.includes(ch)) ?? "";
+const ROW_STAGGER = 130;   // ms between lines
+const LEAD_IN = 170;       // ms a char scrambles before it locks
+const ROW_SPREAD = 430;    // ms from first to last char in a line
+const JITTER = 55;         // +/- ms random offset per char
+const SCRAMBLE_STEP = 42;  // ms between glyph swaps
+
+// small seeded PRNG (mulberry32) so the same text always decodes the same way
+const seeded = (seed) => () => {
+  seed = (seed + 1831565813) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+
+function createDecoder(el, startDelay = 0) {
+  let raf = 0, overlay = null;
+
+  const stop = () => {
+    cancelAnimationFrame(raf);
+    overlay?.remove(); overlay = null;
+    el.style.opacity = "";
+  };
+
+  const run = () => {
+    stop();
+    const stageRect = stage.getBoundingClientRect();
+    const scale = stageRect.width / stage.offsetWidth;         // undo the fit-to-window scaling
+
+    // 1. measure every non-space character with a Range
+    const chars = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const parent = node.parentElement, text = node.nodeValue ?? "";
+      if (!parent) continue;
+      const style = getComputedStyle(parent);
+      for (let i = 0; i < text.length; i++) {
+        if (!text[i].trim()) continue;
+        range.setStart(node, i); range.setEnd(node, i + 1);
+        const r = range.getClientRects()[0];
+        if (r && r.width) chars.push({
+          ch: text[i], style,
+          x: (r.left - stageRect.left) / scale, y: (r.top - stageRect.top) / scale,
+          w: r.width / scale, h: r.height / scale,
+        });
+      }
+    }
+    if (!chars.length) return;
+
+    // 2. group into visual rows by y
+    const rows = [];
+    for (const c of chars) {
+      const row = rows.find((r) => Math.abs(r[0].y - c.y) < c.h / 2);
+      row ? row.push(c) : rows.push([c]);
+    }
+
+    // 3. lock time per char: row stagger + position along the row + seeded jitter
+    let hash = 0;
+    for (const c of chars) hash = (Math.imul(hash, 31) + c.ch.charCodeAt(0)) | 0;
+    const rand = seeded(hash);
+    const lockAt = new Map();
+    rows.forEach((row, ri) => row.forEach((c, ci) => {
+      lockAt.set(c, startDelay + ri * ROW_STAGGER + LEAD_IN + (ci / Math.max(1, row.length - 1)) * ROW_SPREAD + (rand() - 0.5) * 2 * JITTER);
+    }));
+
+    // 4. overlay: one absolutely-positioned span per character, copying the real text styling
+    overlay = document.createElement("span");
+    overlay.setAttribute("aria-hidden", "true");
+    overlay.style.cssText = "position:absolute;left:0;top:0;width:0;height:0;z-index:10;pointer-events:none;user-select:none;letter-spacing:0;white-space:pre;";
+    const spans = chars.map((c) => {
+      const s = document.createElement("span");
+      s.style.cssText = `position:absolute;top:${c.y}px;height:${c.h}px;line-height:${c.h}px;`;
+      for (const p of ["fontFamily", "fontSize", "fontWeight", "fontStyle", "fontStretch", "fontKerning", "fontFeatureSettings", "color", "textShadow"]) s.style[p] = c.style[p] ?? "";
+      s.appendChild(document.createTextNode(""));
+      overlay.appendChild(s);
+      return s;
+    });
+    stage.appendChild(overlay);
+    el.style.opacity = "0";                                    // hide the real text while the overlay animates
+
+    const set = (i, text, x, centred) => {
+      const node = spans[i].firstChild;
+      if (node.nodeValue !== text) node.nodeValue = text;
+      spans[i].style.left = `${x}px`;
+      spans[i].style.transform = centred ? "translateX(-50%)" : "none";   // centre scrambles so width swaps don't shift
+    };
+
+    // 5. animate
+    const t0 = performance.now();
+    const tick = (now) => {
+      const t = now - t0;
+      let pending = false;
+      chars.forEach((c, i) => {
+        const at = lockAt.get(c);
+        if (t >= at) {
+          if (spans[i].dataset.locked) return;
+          spans[i].dataset.locked = "1";
+          set(i, c.ch, c.x, false);                            // final, real character
+          return;
+        }
+        pending = true;
+        const cls = widthClass(c.ch);
+        const glyph = cls && t >= at - LEAD_IN
+          ? cls[Math.floor(seeded(hash + i * 7919 + Math.floor(t / SCRAMBLE_STEP) * 104729)() * cls.length)]
+          : "";                                                // blank until the lead-in window opens
+        set(i, glyph, c.x + c.w / 2, true);
+      });
+      pending ? (raf = requestAnimationFrame(tick)) : stop();
+    };
+    tick(t0);
+  };
+
+  return { run, stop };
+}
+
+const decoder = createDecoder(document.getElementById("title"), 200);
+
+addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "r" || e.key === "R") { if (!reducedMotion) decoder.run(); }
+  else if (e.key === ".") decoder.stop();
+  else if (e.key === "a" || e.key === "A") asciiOn = !asciiOn;
+});
+
+if (!reducedMotion) {
+  (document.fonts?.ready ?? Promise.resolve()).then(() => decoder.run());
+}
+</script>
+</body>
+</html>
