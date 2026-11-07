@@ -5,3 +5,6 @@ dist/
 
 # scratch screenshots in PLAY/tmp (large, regenerable)
 PLAY/tmp/*.png
+
+# scratch files
+tmp/
